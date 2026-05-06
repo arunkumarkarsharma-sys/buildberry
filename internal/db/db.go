@@ -12,6 +12,8 @@ import (
 	"buildberry/internal/config"
 )
 
+var DB *sql.DB
+
 func Connect(cfg config.Config) (*sql.DB, error) {
 
 	dsn := fmt.Sprintf(
@@ -30,6 +32,8 @@ func Connect(cfg config.Config) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	DB = db
 
 	err = db.Ping()
 	if err != nil {
