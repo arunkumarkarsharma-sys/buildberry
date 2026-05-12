@@ -12,13 +12,17 @@ import (
 	"strconv"
 	"strings"
 
+	"database/sql"
+
 	"github.com/xuri/excelize/v2"
 )
 
+var database *sql.DB
+
 func main() {
 	cfg := config.LoadConfig()
-
-	database, err := db.Connect(cfg)
+	var err error
+	database, err = db.Connect(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -79,36 +83,25 @@ func main() {
 		table := strings.TrimPrefix(r.URL.Path, "/api/schema/")
 
 		//Query run
-		rows, err := database.Query("DESCRIBE " + table)
+		schema, err := db.LoadTableSchema(table)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
-
 			return
 		}
-		defer rows.Close()
-		//struct
+
 		type Column struct {
 			Name string `json:"name"`
-
 			Type string `json:"type"`
 		}
 
-		//loop and scan
-
 		columns := []Column{}
 
-		for rows.Next() {
-			var field, colType, null, key, extra string
-			var defaultVal *string
-
-			rows.Scan(&field, &colType, &null, &key, &defaultVal, &extra)
-
+		for i := range schema.Columns {
 			columns = append(columns, Column{
-				Name: field,
-				Type: colType,
+				Name: schema.Columns[i].Name,
+				Type: schema.Columns[i].DataType,
 			})
 		}
-
 		//json responce
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -274,35 +267,22 @@ func main() {
 		}
 
 		//DB columns
-		cols, err := database.Query("DESCRIBE " + table)
+		schema, err := db.LoadTableSchema(table)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
-		defer cols.Close()
 
-		dbColumns := []string{}
-		dbTypes := []string{}
-		requiredCols := []string{}
+		dbColumns := schema.Columns
 
-		for cols.Next() {
-			var field, colType, null, key, extra string
-			var defaultVal *string
+		requiredCols := db.GetRequiredColumns(schema)
 
-			cols.Scan(&field, &colType, &null, &key, &defaultVal, &extra)
-
-			dbColumns = append(dbColumns, field)
-			dbTypes = append(dbTypes, colType)
-
-			if null == "NO" && key != "PRI" {
-				requiredCols = append(requiredCols, field)
-			}
-		}
 		for _, h := range headers {
 			found := false
 			for _, dbCol := range dbColumns {
-				if h == dbCol {
+				if h == dbCol.Name {
 					found = true
+					break
 				}
 			}
 			if !found {
@@ -342,6 +322,7 @@ func main() {
 			http.Error(w, err.Error(), 500)
 			return
 		}
+		defer tx.Rollback()
 
 		total := 0
 		inserted := 0
@@ -359,17 +340,21 @@ func main() {
 				return
 			}
 
+			if len(record) != len(headers) {
+				failed++
+				errorsList = append(errorsList, fmt.Sprintf("row %d failed: column mismatch", total+1))
+				continue
+			}
+
 			total++
 			values := make([]interface{}, len(record))
 
 			for i, v := range record {
-
 				var colType string
 
-				// match header with db column type
-				for j, col := range dbColumns {
-					if headers[i] == col {
-						colType = dbTypes[j]
+				for _, col := range dbColumns {
+					if headers[i] == col.Name {
+						colType = col.DataType
 						break
 					}
 				}
@@ -396,19 +381,18 @@ func main() {
 			inserted++
 		}
 
-		//commit
-		err = tx.Commit()
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 
 		//response
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "success",
 			"total":    total,
 			"inserted": inserted,
 			"failed":   failed,
-			"errors":   errorsList,
 		})
 	})
 
@@ -427,10 +411,10 @@ func main() {
 
 func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 
-	// limit file size
+	//limit file size
 	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 
-	// table extract
+	//table extract
 	table := strings.TrimPrefix(r.URL.Path, "/api/import-excel/")
 
 	allowed := map[string]bool{
@@ -442,7 +426,7 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// read file
+	//read file//////
 	file, _, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -450,7 +434,7 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// open excel
+	//open excel
 	f, err := excelize.OpenReader(file)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -471,38 +455,23 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 
 	headers := rows[0]
 
-	// DB schema
-	cols, err := db.DB.Query("DESCRIBE " + table)
+	//DB schema
+	schema, err := db.LoadTableSchema(table)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	defer cols.Close()
 
-	dbColumns := []string{}
-	dbTypes := []string{}
-	requiredCols := []string{}
+	dbColumns := schema.Columns
 
-	for cols.Next() {
-		var field, colType, null, key, extra string
-		var defaultVal *string
-
-		cols.Scan(&field, &colType, &null, &key, &defaultVal, &extra)
-
-		dbColumns = append(dbColumns, field)
-		dbTypes = append(dbTypes, colType)
-
-		if null == "NO" && key != "PRI" {
-			requiredCols = append(requiredCols, field)
-		}
-	}
-
-	// unknown column check
+	requiredCols := db.GetRequiredColumns(schema)
+	//unknown column check
 	for _, h := range headers {
 		found := false
 		for _, dbCol := range dbColumns {
-			if h == dbCol {
+			if h == dbCol.Name {
 				found = true
+				break
 			}
 		}
 		if !found {
@@ -511,7 +480,7 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// required column check
+	//required column check
 	for _, req := range requiredCols {
 		found := false
 		for _, h := range headers {
@@ -525,7 +494,7 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// placeholders
+	//placeholders
 	placeholders := make([]string, len(headers))
 	for i := range headers {
 		placeholders[i] = "?"
@@ -538,18 +507,20 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 		strings.Join(placeholders, ","),
 	)
 
-	tx, err := db.DB.Begin()
+	tx, err := database.Begin()
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	defer tx.Rollback()
 
 	total := 0
 	inserted := 0
 	failed := 0
 	errorsList := []string{}
 
-	// loop rows (skip header)
+	//loop rows
+
 	for i, row := range rows[1:] {
 
 		total++
@@ -560,10 +531,10 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 
 			var colType string
 
-			// match excel header with db column type
-			for k, col := range dbColumns {
-				if headers[j] == col {
-					colType = dbTypes[k]
+			//match excel header with db column
+			for _, col := range dbColumns {
+				if headers[i] == col.Name {
+					colType = col.DataType
 					break
 				}
 			}
@@ -579,7 +550,7 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 			values[j] = converted
 		}
 
-		_, err := tx.Exec(query, values...)
+		_, err = tx.Exec(query, values...)
 		if err != nil {
 			failed++
 			errorsList = append(errorsList,
@@ -590,17 +561,12 @@ func importExcelHandler(w http.ResponseWriter, r *http.Request) {
 		inserted++
 	}
 
-	err = tx.Commit()
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":   "success",
 		"total":    total,
 		"inserted": inserted,
 		"failed":   failed,
-		"errors":   errorsList,
 	})
 }
 
